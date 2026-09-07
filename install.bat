@@ -17,8 +17,7 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 
 echo.
-echo Step 1: Install Ollama from https://ollama.com/download
-echo Step 2: Run: ollama pull llama3.2
-echo Step 3: Fill in .env file with your model paths
-echo Step 4: Put your PDF in the input\ folder
-echo Step 5: Run run.bat
+echo Step 1: Activate the Conda environment: conda activate ocr-redaction-poc
+echo Step 2: Set BOSCH_GATEWAY_URL and BOSCH_GATEWAY_TOKEN in .env
+echo Step 3: Put your PDF in the input\ folder
+echo Step 4: Run run.bat

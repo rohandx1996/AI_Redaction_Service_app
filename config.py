@@ -2,7 +2,6 @@ from dataclasses import dataclass
 from pathlib import Path
 import os
 
-import requests
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -10,9 +9,10 @@ load_dotenv()
 
 @dataclass
 class Settings:
-    GOT_OCR_MODEL_PATH: str = "models/got_ocr"
-    OLLAMA_MODEL: str = "llama3.2"
-    OLLAMA_BASE_URL: str = "http://localhost:11434"
+    got_ocr_model_path: str = "models/got_ocr"
+    bosch_gateway_url: str = ""
+    bosch_gateway_token: str = ""
+    llm_model: str = "gpt-4o"
     INPUT_DIR: str = "input"
     OUTPUT_DIR: str = "output"
     LOGS_DIR: str = "logs"
@@ -21,9 +21,10 @@ class Settings:
 
 def load_settings() -> Settings:
     settings = Settings(
-        GOT_OCR_MODEL_PATH=os.getenv("GOT_OCR_MODEL_PATH", "models/got_ocr"),
-        OLLAMA_MODEL=os.getenv("OLLAMA_MODEL", "llama3.2"),
-        OLLAMA_BASE_URL=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+        got_ocr_model_path=os.getenv("GOT_OCR_MODEL_PATH", "models/got_ocr"),
+        bosch_gateway_url=os.getenv("BOSCH_GATEWAY_URL", ""),
+        bosch_gateway_token=os.getenv("BOSCH_GATEWAY_TOKEN", ""),
+        llm_model=os.getenv("LLM_MODEL", "gpt-4o"),
         INPUT_DIR=os.getenv("INPUT_DIR", "input"),
         OUTPUT_DIR=os.getenv("OUTPUT_DIR", "output"),
         LOGS_DIR=os.getenv("LOGS_DIR", "logs"),
@@ -31,15 +32,11 @@ def load_settings() -> Settings:
     )
 
     project_root = Path(__file__).resolve().parent
-    model_path = (project_root / settings.GOT_OCR_MODEL_PATH).resolve()
+    model_path = (project_root / settings.got_ocr_model_path).resolve()
     if not model_path.exists():
         print(f"WARNING: GOT_OCR_MODEL_PATH does not exist on disk: {model_path}")
 
-    try:
-        response = requests.get(f"{settings.OLLAMA_BASE_URL}/api/tags", timeout=3)
-        if response.status_code != 200:
-            print(f"WARNING: Ollama is not reachable at {settings.OLLAMA_BASE_URL}")
-    except requests.RequestException:
-        print(f"WARNING: Ollama is not reachable at {settings.OLLAMA_BASE_URL}")
-
     return settings
+
+
+settings = load_settings()

@@ -10,4 +10,4 @@ sentencepiece==0.2.0
 accelerate==1.0.1
 pdfplumber==0.11.4
 langdetect==1.0.9
-ollama==0.3.3
+openai==1.51.0

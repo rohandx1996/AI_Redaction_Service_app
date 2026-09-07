@@ -49,7 +49,7 @@ rem --- requirements.txt ---
   echo accelerate==1.0.1
   echo pdfplumber==0.11.4
   echo langdetect==1.0.9
-  echo ollama==0.3.3
+  echo openai
 )
 
 rem --- install.bat ---
@@ -73,11 +73,10 @@ rem --- install.bat ---
   echo pip install -r requirements.txt
   echo.
   echo echo.
-  echo echo Step 1: Install Ollama from https://ollama.com/download
-  echo echo Step 2: Run: ollama pull llama3.2
-  echo echo Step 3: Fill in .env file with your model paths
-  echo echo Step 4: Put your PDF in the input\ folder
-  echo echo Step 5: Run run.bat
+  echo echo Step 1: Activate the Conda environment: conda activate ocr-redaction-poc
+  echo echo Step 2: Set BOSCH_GATEWAY_URL and BOSCH_GATEWAY_TOKEN in .env
+  echo echo Step 3: Put your PDF in the input\ folder
+  echo echo Step 4: Run run.bat
 )
 
 rem --- run.bat ---
@@ -101,8 +100,9 @@ rem --- .env ---
 > "%ROOT%\.env" (
   echo # Model settings
   echo GOT_OCR_MODEL_PATH=models/got_ocr
-  echo OLLAMA_MODEL=llama3.2
-  echo OLLAMA_BASE_URL=http://localhost:11434
+  echo BOSCH_GATEWAY_URL=
+  echo BOSCH_GATEWAY_TOKEN=
+  echo LLM_MODEL=gpt-4o
   echo.
   echo # Pipeline settings
   echo INPUT_DIR=input
@@ -126,8 +126,9 @@ rem --- config.py ---
   echo @dataclass
   echo class Settings:
   echo     GOT_OCR_MODEL_PATH: str = "models/got_ocr"
-  echo     OLLAMA_MODEL: str = "llama3.2"
-  echo     OLLAMA_BASE_URL: str = "http://localhost:11434"
+  echo     bosch_gateway_url: str = ""
+  echo     bosch_gateway_token: str = ""
+  echo     llm_model: str = "gpt-4o"
   echo     INPUT_DIR: str = "input"
   echo     OUTPUT_DIR: str = "output"
   echo     LOGS_DIR: str = "logs"
@@ -136,8 +137,9 @@ rem --- config.py ---
   echo def load_settings() -> Settings:
   echo     settings = Settings(
   echo         GOT_OCR_MODEL_PATH=os.getenv("GOT_OCR_MODEL_PATH", "models/got_ocr"),
-  echo         OLLAMA_MODEL=os.getenv("OLLAMA_MODEL", "llama3.2"),
-  echo         OLLAMA_BASE_URL=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+  echo         bosch_gateway_url=os.getenv("BOSCH_GATEWAY_URL", ""),
+  echo         bosch_gateway_token=os.getenv("BOSCH_GATEWAY_TOKEN", ""),
+  echo         llm_model=os.getenv("LLM_MODEL", "gpt-4o"),
   echo         INPUT_DIR=os.getenv("INPUT_DIR", "input"),
   echo         OUTPUT_DIR=os.getenv("OUTPUT_DIR", "output"),
   echo         LOGS_DIR=os.getenv("LOGS_DIR", "logs"),
@@ -148,13 +150,6 @@ rem --- config.py ---
   echo     model_path = (project_root / settings.GOT_OCR_MODEL_PATH).resolve()
   echo     if not model_path.exists():
   echo         print(f"WARNING: GOT_OCR_MODEL_PATH does not exist on disk: {model_path}")
-  echo.
-  echo     try:
-  echo         response = requests.get(f"{settings.OLLAMA_BASE_URL}/api/tags", timeout=3)
-  echo         if response.status_code != 200:
-  echo             print(f"WARNING: Ollama is not reachable at {settings.OLLAMA_BASE_URL}")
-  echo     except requests.RequestException:
-  echo         print(f"WARNING: Ollama is not reachable at {settings.OLLAMA_BASE_URL}")
   echo.
   echo     return settings
 )
