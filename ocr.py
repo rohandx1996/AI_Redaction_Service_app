@@ -8,12 +8,14 @@
 
 from pathlib import Path
 from dataclasses import dataclass, field
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModel
 import torch
 import fitz
 from PIL import Image
 import tempfile
 import os
+from contextlib import nullcontext
+from unittest.mock import patch
 from rich.console import Console
 from rich.progress import track
 
@@ -82,11 +84,13 @@ class GotOCREngine:
             str(self.model_path),
             trust_remote_code=True,
         )
-        self.model = AutoModelForCausalLM.from_pretrained(
+        self.model = AutoModel.from_pretrained(
             str(self.model_path),
             trust_remote_code=True,
             device_map="cpu",
             torch_dtype=torch.float32,
+            use_safetensors=True,
+            pad_token_id=self.tokenizer.eos_token_id,
         )
         self.model.eval()
         self.loaded = True
@@ -110,11 +114,7 @@ class GotOCREngine:
 
         try:
             with torch.no_grad():
-                result_text = self.model.chat(
-                    self.tokenizer,
-                    tmp_path,
-                    ocr_type="ocr",
-                )
+                result_text = self._chat_on_cpu(tmp_path)
         finally:
             try:
                 os.unlink(tmp_path)
@@ -157,6 +157,23 @@ class GotOCREngine:
             raw_text="\n".join(lines),
             has_tables=has_tables,
         )
+
+    def _chat_on_cpu(self, image_path: str) -> str:
+        """Run GOT-OCR2 chat while adapting its CUDA-only helper to CPU."""
+        def keep_on_cpu(tensor, *args, **kwargs):
+            return tensor
+
+        def keep_float32(tensor, *args, **kwargs):
+            return tensor.float()
+
+        with patch.object(torch.Tensor, "cuda", keep_on_cpu), \
+                patch.object(torch.Tensor, "half", keep_float32), \
+                patch.object(torch, "autocast", lambda *args, **kwargs: nullcontext()):
+            return self.model.chat(
+                self.tokenizer,
+                image_path,
+                ocr_type="ocr",
+            )
 
     def process_document(self, pdf_path: str) -> list[PageOCRResult]:
         """Render every PDF page and return its GOT-OCR2 results."""

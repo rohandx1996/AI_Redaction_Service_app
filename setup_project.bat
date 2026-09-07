@@ -46,6 +46,8 @@ rem --- requirements.txt ---
   echo torch==2.4.1
   echo torchvision==0.19.1
   echo sentencepiece==0.2.0
+  echo tiktoken
+  echo verovio
   echo accelerate==1.0.1
   echo pdfplumber==0.11.4
   echo langdetect==1.0.9

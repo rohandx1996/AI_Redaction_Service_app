@@ -7,6 +7,8 @@ transformers==4.46.0
 torch==2.4.1
 torchvision==0.19.1
 sentencepiece==0.2.0
+tiktoken
+verovio
 accelerate==1.0.1
 pdfplumber==0.11.4
 langdetect==1.0.9
