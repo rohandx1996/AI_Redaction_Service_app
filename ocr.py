@@ -1,10 +1,10 @@
 # GOT-OCR2 runs on CPU only — no GPU required.
 # Expected speed: 30 to 60 seconds per page on CPU.
 # Model must be downloaded first using download_model.bat
-# Bounding boxes are line-level estimates, not word-level.
+# Text-layer PDFs use precise PyMuPDF word coordinates.
+# Scanned PDFs use line-level estimates because GOT-OCR2 OCR output
+# does not include word coordinates in ocr_type="ocr" mode.
 # This is sufficient for POC validation.
-# For production: use Azure Document Intelligence for
-# pixel-perfect word-level bounding boxes.
 
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -102,8 +102,9 @@ class GotOCREngine:
         page_number: int,
         page_width: float,
         page_height: float,
+        source_words: list[tuple] | None = None,
     ) -> PageOCRResult:
-        """Run GOT-OCR2 on one page image and create line-level spans."""
+        """Run GOT-OCR2 and attach precise text-layer or fallback line boxes."""
         if not self.loaded:
             self.load_model()
 
@@ -122,28 +123,13 @@ class GotOCREngine:
                 pass
 
         lines = [line.strip() for line in result_text.splitlines() if line.strip()]
-        total_lines = max(len(lines), 1)
-        spans = []
-        # NOTE: Bounding boxes are estimated per line (equal height split).
-        # GOT-OCR2 ocr_type="ocr" does not return word-level coordinates.
-        # For pixel-perfect bboxes in production use Azure Document
-        # Intelligence or GOT-OCR2 with ocr_type="format" + coord parsing.
-        for index, line in enumerate(lines):
-            line_height = page_height / total_lines
-            y0 = index * line_height
-            y1 = y0 + line_height
-            spans.append(
-                TextSpan(
-                    index=index,
-                    text=line,
-                    page_number=page_number,
-                    x0=0.0,
-                    y0=y0,
-                    x1=page_width,
-                    y1=y1,
-                    confidence=1.0,
-                )
-            )
+        spans = self._build_spans(
+            lines,
+            page_number,
+            page_width,
+            page_height,
+            source_words or [],
+        )
 
         has_tables = (
             "<table" in result_text.lower()
@@ -157,6 +143,57 @@ class GotOCREngine:
             raw_text="\n".join(lines),
             has_tables=has_tables,
         )
+
+    def _build_spans(
+        self,
+        lines: list[str],
+        page_number: int,
+        page_width: float,
+        page_height: float,
+        source_words: list[tuple],
+    ) -> list[TextSpan]:
+        """Build spans from PDF word boxes, falling back to estimated line boxes."""
+        if source_words:
+            spans = []
+            word_index = 0
+            for index, line in enumerate(lines):
+                line_tokens = line.split()
+                matched = source_words[word_index:word_index + len(line_tokens)]
+                if not matched:
+                    continue
+                word_index += len(matched)
+                spans.append(
+                    TextSpan(
+                        index=index,
+                        text=line,
+                        page_number=page_number,
+                        x0=min(word[0] for word in matched),
+                        y0=min(word[1] for word in matched),
+                        x1=max(word[2] for word in matched),
+                        y1=max(word[3] for word in matched),
+                        confidence=1.0,
+                    )
+                )
+            if spans:
+                return spans
+
+        # GOT-OCR2 ocr_type="ocr" does not return word-level coordinates.
+        # For scanned pages without a PDF text layer, use line-level estimates.
+        total_lines = max(len(lines), 1)
+        line_height = page_height / total_lines
+        return [
+            TextSpan(
+                index=index,
+                text=line,
+                page_number=page_number,
+                x0=0.0,
+                y0=index * line_height,
+                x1=page_width,
+                y1=(index + 1) * line_height,
+                confidence=1.0,
+            )
+            for index, line in enumerate(lines)
+        ]
 
     def _chat_on_cpu(self, image_path: str) -> str:
         """Run GOT-OCR2 chat while adapting its CUDA-only helper to CPU."""
@@ -192,11 +229,13 @@ class GotOCREngine:
                 mat = fitz.Matrix(150 / 72, 150 / 72)
                 pix = page.get_pixmap(matrix=mat)
                 image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                source_words = page.get_text("words")
                 result = self.process_page(
                     image,
                     page_num,
                     page_width,
                     page_height,
+                    source_words,
                 )
                 results.append(result)
                 self.console.print(
