@@ -5,3 +5,8 @@ input/*
 logs/*
 models/*
 output/*
+*.log
+run_log.txt
+CHAT_HANDOFF*.md
+temp_pdf_compare/
+tmp_*.ps1
