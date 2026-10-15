@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bosch-ocr-redaction"
+version = "0.1.0"
+description = "Fail-closed original-PDF redaction using OCR, vision models, and PDF auditing"
+readme = "docs/README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "pymupdf==1.24.10",
+  "python-dotenv==1.0.1",
+  "pillow==10.4.0",
+  "numpy==1.26.4",
+  "opencv-contrib-python==4.10.0.84",
+  "requests==2.32.3",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+ocr-redact = "redaction_flow.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["redaction_flow*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

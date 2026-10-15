@@ -1,0 +1,3 @@
+# Install into a dedicated PaddleX 3 runtime/package target; do not combine with PaddleOCR 2.x.
+paddlepaddle==3.2.1
+paddlex[ocr-core]==3.7.2

@@ -1,22 +1,9 @@
+# Core integrated runner dependencies. Install Paddle runtimes separately:
+#   pip install -r requirements-ocr-worker.txt
+#   pip install -r requirements-ppdoclayout3.txt
 pymupdf==1.24.10
 python-dotenv==1.0.1
-rich==13.9.2
 pillow==10.4.0
 numpy==1.26.4
-opencv-python==4.6.0.66
+opencv-contrib-python==4.10.0.84
 requests==2.32.3
-pandas==2.3.3
-openpyxl==3.1.5
-litellm==1.101.0
-paddleocr==2.7.3
-paddlepaddle==2.6.2
-transformers==4.46.0
-torch==2.4.1
-torchvision==0.19.1
-sentencepiece==0.2.0
-tiktoken
-verovio
-accelerate==1.0.1
-pdfplumber==0.11.4
-langdetect==1.0.9
-openai==1.51.0

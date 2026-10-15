@@ -1,0 +1,4 @@
+# Install in an isolated PaddleOCR 2.x environment used only by redaction_flow/ocr_worker.py.
+paddlepaddle==2.6.2
+paddleocr==2.7.3
+opencv-python==4.6.0.66
