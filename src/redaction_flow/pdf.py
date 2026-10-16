@@ -53,20 +53,32 @@ def audit_pdf(
     sensitive_values: list[str] | None = None,
     redaction_regions: list[dict] | None = None,
     post_redaction_detections: list[dict] | None = None,
+    sensitive_values_by_page: dict[int, list[str]] | None = None,
 ) -> dict:
     """Inspect a saved PDF for hidden objects and searchable selected values."""
     pdf_file = Path(pdf_path)
-    expected_values = sorted({
-        normalized for value in (sensitive_values or [])
-        if (normalized := _normalized_text(str(value)))
-    })
+    global_values: list[str] = []
+    expected_by_page: dict[int, list[str]] = {}
+    if sensitive_values_by_page is None:
+        global_values = sorted({
+            normalized for value in (sensitive_values or [])
+            if (normalized := _normalized_text(str(value)))
+        })
+    else:
+        for page_number, values in sensitive_values_by_page.items():
+            expected_by_page[int(page_number)] = sorted({
+                normalized for value in values
+                if (normalized := _normalized_text(str(value)))
+            })
     with fitz.open(str(pdf_file)) as document:
+        if sensitive_values_by_page is None:
+            expected_by_page = {page_number: global_values for page_number in range(len(document))}
         extracted_pages = [page.get_text("text") for page in document]
         normalized_pages = [_normalized_text(text) for text in extracted_pages]
         leaked_values = [
             {"page_number": page_number, "value_index": value_index}
             for page_number, text in enumerate(normalized_pages)
-            for value_index, value in enumerate(expected_values)
+            for value_index, value in enumerate(expected_by_page.get(page_number, []))
             if value in text
         ]
         raw_metadata = {
@@ -103,9 +115,7 @@ def audit_pdf(
             leftover = document[page_number].get_textbox(rect).strip()
             if leftover:
                 hidden_ocr_text.append({"page_number": page_number, "text": leftover})
-    qr_barcodes_remaining = [
-        detection for detection in (post_redaction_detections or []) if detection.get("decoded")
-    ]
+    qr_barcodes_remaining = post_redaction_detections or []
     findings = {
         "author": author,
         "creator": creator,
@@ -121,30 +131,32 @@ def audit_pdf(
         "qr_barcodes_remaining": qr_barcodes_remaining,
         "leaked_values": leaked_values,
     }
+    expected_value_count = len({value for values in expected_by_page.values() for value in values})
     passed = not any(findings.values())
     return {
         "pdf": str(pdf_file),
         "status": "PASS" if passed else "FAIL",
         "page_count": len(extracted_pages),
-        "sensitive_value_count": len(expected_values),
+        "sensitive_value_count": expected_value_count,
         "findings": findings,
     }
 
 
 def detect_machine_readable_regions(pdf_path: str | Path) -> tuple[list[dict], list[dict]]:
-    """Detect QR codes and barcodes on original PDF pages for automatic redaction."""
+    """Detect QR-code/barcode geometry without decoding payloads."""
     regions = []
     detections = []
     qr_detector = cv2.QRCodeDetector()
     barcode_detector = cv2.barcode_BarcodeDetector()
     with fitz.open(str(pdf_path)) as document:
         for page_number, page in enumerate(document):
-            pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            detection_scale = 150 / 72
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(detection_scale, detection_scale), alpha=False)
             image = np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(pixmap.height, pixmap.width, 3)
             scale_x = page.rect.width / pixmap.width
             scale_y = page.rect.height / pixmap.height
-            decoded, points, _ = qr_detector.detectAndDecode(image)
-            if points is not None:
+            found, points = qr_detector.detect(image)
+            if found and points is not None:
                 points = points.reshape(-1, 2)
                 rect = fitz.Rect(
                     points[:, 0].min() * scale_x, points[:, 1].min() * scale_y,
@@ -152,19 +164,15 @@ def detect_machine_readable_regions(pdf_path: str | Path) -> tuple[list[dict], l
                 ) & page.rect
                 if not rect.is_empty:
                     regions.append({"page_number": page_number, "x0": rect.x0, "y0": rect.y0, "x1": rect.x1, "y1": rect.y1})
-                    detections.append({"page_number": page_number, "type": "QR", "decoded": bool(decoded)})
-            barcode_result = barcode_detector.detectAndDecode(image)
-            if len(barcode_result) == 3:
-                decoded_value, barcode_type, points = barcode_result
-                decoded_info = [decoded_value] if points is not None else []
-                barcode_types = [barcode_type] if points is not None else []
-                corners = [points] if points is not None else []
+                    detections.append({"page_number": page_number, "type": "QR"})
+            found, points = barcode_detector.detect(image)
+            if found and points is not None:
+                boxes = np.asarray(points)
+                if boxes.ndim == 2:
+                    boxes = boxes[np.newaxis, ...]
             else:
-                _, decoded_info, barcode_types, corners = barcode_result
-            decoded_info = decoded_info if decoded_info is not None else []
-            barcode_types = barcode_types if barcode_types is not None else []
-            corners = corners if corners is not None else []
-            for decoded_value, barcode_type, points in zip(decoded_info, barcode_types, corners):
+                boxes = []
+            for points in boxes:
                 points = np.asarray(points).reshape(-1, 2)
                 rect = fitz.Rect(
                     points[:, 0].min() * scale_x, points[:, 1].min() * scale_y,
@@ -172,7 +180,7 @@ def detect_machine_readable_regions(pdf_path: str | Path) -> tuple[list[dict], l
                 ) & page.rect
                 if not rect.is_empty:
                     regions.append({"page_number": page_number, "x0": rect.x0, "y0": rect.y0, "x1": rect.x1, "y1": rect.y1})
-                    detections.append({"page_number": page_number, "type": str(barcode_type), "decoded": bool(decoded_value)})
+                    detections.append({"page_number": page_number, "type": "BARCODE"})
     return regions, detections
 
 
@@ -210,6 +218,7 @@ def redact_pdf(
     machine_readable_regions: list[dict] | None = None,
     machine_readable_detections: list[dict] | None = None,
     text_redaction_mode: int = 0,
+    sensitive_values_by_page: dict[int, list[str]] | None = None,
 ) -> dict:
     """Apply irreversible redactions, remove hidden PDF objects, and audit the result."""
     input_file = Path(pdf_path)
@@ -249,7 +258,10 @@ def redact_pdf(
     finally:
         document.close()
     _, post_redaction_detections = detect_machine_readable_regions(output_file)
-    audit = audit_pdf(output_file, sensitive_values, regions, post_redaction_detections)
+    audit = audit_pdf(
+        output_file, sensitive_values, regions, post_redaction_detections,
+        sensitive_values_by_page,
+    )
     audit["removed_objects"] = removed_objects
     audit["machine_readable_detections"] = machine_readable_detections or []
     return audit

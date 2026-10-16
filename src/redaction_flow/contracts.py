@@ -20,7 +20,6 @@ class Region:
     kind: str
     bbox: list[float]
     score: float = 0.0
-    decoded: bool | None = None
     crop_path: str | None = None
     source: str = ""
 

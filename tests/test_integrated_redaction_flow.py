@@ -14,10 +14,17 @@ from redaction_flow.coordinates import crop_bbox_to_page_pixels, page_pixels_to_
 from redaction_flow.analyzers import PaddlePageAnalyzer
 from redaction_flow.gateway import VisionGateway
 from redaction_flow.policy import can_release, release_blockers
-from redaction_flow.contracts import PageRecord, Region
+from redaction_flow.contracts import PageRecord, Region, TextSpan
 from redaction_flow.runner import IntegratedRedactionRunner
 from redaction_flow.stages import RedactionStages
-from redaction_flow.pdf import redact_pdf
+from redaction_flow.pdf import audit_pdf, redact_pdf
+from redaction_flow.prompts import ORIGINAL_EXTRACTION_SYSTEM
+
+
+def _copy_pdf_fixture(source: Path, output: Path) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with fitz.open(source) as document:
+        document.save(output)
 
 
 class CoordinateTests(unittest.TestCase):
@@ -97,8 +104,45 @@ class PageAnalyzerContractTests(unittest.TestCase):
         self.assertEqual(len(images), 1)
         self.assertEqual(images[0].bbox, [100.0, 120.0, 300.0, 320.0])
 
+    def test_code_candidate_over_dense_text_is_filtered_but_image_candidate_kept(self):
+        spans = [
+            TextSpan(
+                i, f"text-{i}", 0.99,
+                [[10, y], [90, y], [90, y + 8], [10, y + 8]],
+            )
+            for i, y in enumerate((10, 30, 50))
+        ]
+        false_positive = Region("qr_code", [10, 5, 30, 65], 0.8)
+        image_candidate = Region("qr_code", [40, 5, 60, 65], 0.8)
+        containing_image = Region("image", [35, 0, 70, 70], 0.9)
+
+        filtered = PaddlePageAnalyzer._filter_text_overlapped_code_candidates(
+            [false_positive, image_candidate], spans, [containing_image],
+        )
+
+        self.assertEqual(filtered, [image_candidate])
+
+    def test_code_detection_uses_geometry_without_decoding(self):
+        import numpy as np
+
+        qr_detector = SimpleNamespace(
+            detect=lambda _image: (True, np.asarray([[[1, 2], [8, 2], [8, 9], [1, 9]]], dtype=float)),
+        )
+        barcode_detector = SimpleNamespace(detect=lambda _image: (False, None))
+        with patch("redaction_flow.analyzers.cv2.QRCodeDetector", return_value=qr_detector), \
+                patch("redaction_flow.analyzers.cv2.barcode_BarcodeDetector", return_value=barcode_detector):
+            regions = PaddlePageAnalyzer._codes(np.zeros((20, 20, 3), dtype=np.uint8))
+
+        self.assertEqual(len(regions), 1)
+        self.assertEqual(regions[0].kind, "qr_code")
+        self.assertEqual(regions[0].bbox, [1.0, 2.0, 8.0, 9.0])
+
 
 class MappingTests(unittest.TestCase):
+    def test_extraction_policy_preserves_lab_signoff(self):
+        self.assertIn("Preserve the testing laboratory's", ORIGINAL_EXTRACTION_SYSTEM)
+        self.assertIn("signatures and names belonging to those", ORIGINAL_EXTRACTION_SYSTEM)
+
     def test_invalid_span_indices_are_not_accepted_and_values_block_release(self):
         stages = RedactionStages(VisionGateway("https://example.invalid", "token"), "opus", "opus", "haiku", "opus")
         fake = {"mappings": [{"value": "ACME", "span_indices": [99], "confidence": 0.99}], "unmatched": []}
@@ -121,6 +165,46 @@ class MappingTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     stages.classify_crop(crop)
 
+    def test_targeted_review_returns_only_supplied_flag_ids(self):
+        from PIL import Image
+
+        stages = RedactionStages(
+            VisionGateway("https://example.invalid", "token"), "opus", "opus", "haiku", "opus",
+        )
+        import io
+        buffer = io.BytesIO()
+        Image.new("RGB", (40, 30), "white").save(buffer, format="PNG")
+        response = {
+            "overall_decision": "APPROVE", "confidence": 0.99,
+            "checks": [{"id": "B4", "decision": "APPROVE", "confidence": 0.98,
+                        "remark": "Flagged mark is clearly laboratory print"}],
+            "remarks": ["Only supplied flag checked"],
+        }
+        with patch.object(stages.reviewer_gateway, "complete", return_value=(response, {})) as complete:
+            result = stages.review_flagged_page(
+                buffer.getvalue(), buffer.getvalue(), 3,
+                [{"id": "B4", "reason": "Faint mark of unclear role"}],
+            )
+        self.assertEqual(result["checks"][0]["id"], "B4")
+        self.assertEqual(result["checks"][0]["remark"], "Flagged mark is clearly laboratory print")
+        self.assertIsNotNone(complete.call_args.kwargs["image"])
+
+    def test_targeted_review_rejects_missing_flag_id(self):
+        from PIL import Image
+        import io
+
+        stages = RedactionStages(VisionGateway("https://example.invalid", "token"), "opus", "opus", "haiku", "opus")
+        buffer = io.BytesIO()
+        Image.new("RGB", (8, 8), "white").save(buffer, format="PNG")
+        with patch.object(stages.reviewer_gateway, "complete", return_value=(
+            {"overall_decision": "APPROVE", "confidence": 1.0, "checks": [], "remarks": []}, {}
+        )):
+            with self.assertRaises(ValueError):
+                stages.review_flagged_page(
+                    buffer.getvalue(), buffer.getvalue(), 0,
+                    [{"id": "B0", "reason": "Needs review"}],
+                )
+
 
 class ReleaseGateTests(unittest.TestCase):
     def test_review_unmatched_and_errors_prevent_release(self):
@@ -129,12 +213,67 @@ class ReleaseGateTests(unittest.TestCase):
         blockers = release_blockers([{"text": "ambiguous"}], [], [])
         self.assertFalse(can_release(audit, blockers))
 
+    def test_qr_description_is_machine_code_specific(self):
+        self.assertTrue(IntegratedRedactionRunner._is_machine_code_description(
+            {"value": "CHECK REPORT QR code", "reason": "No OCR span"},
+        ))
+        self.assertFalse(IntegratedRedactionRunner._is_machine_code_description(
+            {"value": "Troy Chang signature", "reason": "No OCR span"},
+        ))
+
 
 class OrchestrationTests(unittest.TestCase):
+    def test_second_review_is_called_only_for_flagged_pages(self):
+        from PIL import Image
+        import io
+
+        class FakeStages:
+            reviewer_model = "fast-reviewer"
+            review_threshold = 0.95
+
+            def __init__(self):
+                self.pages = []
+
+            def review_flagged_page(self, _original, _redacted, page_number, flags):
+                self.pages.append(page_number)
+                return {
+                    "page_number": page_number, "model": self.reviewer_model,
+                    "overall_decision": "APPROVE", "confidence": 0.99,
+                    "checks": [{"id": flag["id"], "decision": "APPROVE",
+                                "confidence": 0.99, "remark": "Visibly benign"} for flag in flags],
+                    "remarks": [],
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf_path = root / "pair.pdf"
+            doc = fitz.open()
+            doc.new_page(width=200, height=100)
+            doc.new_page(width=200, height=100)
+            doc.save(pdf_path)
+            doc.close()
+            image_path = root / "page.png"
+            Image.new("RGB", (200, 100), "white").save(image_path)
+            page_image = (image_path, None)
+            stages = FakeStages()
+            runner = IntegratedRedactionRunner(SimpleNamespace(dpi=72), stages)
+            reports, _elapsed, approved, errors = runner._review_flagged_pages(
+                pdf_path, [page_image, page_image],
+                [{"page_number": 1, "reason": "A faint mark needs a second look"}],
+                root / "review",
+            )
+
+        self.assertEqual(stages.pages, [1])
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(approved, {0})
+        self.assertEqual(errors, [])
+
     def test_original_image_extraction_precedes_ocr_and_clean_run_releases(self):
         events = []
 
         class FakeAnalyzer:
+            dpi = 150
+
             def render_page(self, page, page_number, output_dir):
                 import numpy as np
                 from PIL import Image
@@ -153,6 +292,8 @@ class OrchestrationTests(unittest.TestCase):
             mapping_model = "opus"
             classifier_model = "haiku"
             material_model = "opus"
+            reviewer_model = "haiku"
+            review_threshold = 0.95
 
             def extract_page(self, image_path, page_number):
                 events.append("vision_extract")
@@ -175,19 +316,20 @@ class OrchestrationTests(unittest.TestCase):
             doc.close()
 
             def fake_redact(_source, output, *_args, **_kwargs):
-                Path(output).parent.mkdir(parents=True, exist_ok=True)
-                Path(output).write_bytes(b"fixture redacted output")
+                _copy_pdf_fixture(_source, Path(output))
                 return {"status": "PASS", "findings": {}}
 
             runner = IntegratedRedactionRunner(FakeAnalyzer(), FakeStages())
             with patch("redaction_flow.runner.redact_pdf", side_effect=fake_redact):
                 result = runner.run_document(source, root / "batch", page_limit=1)
             self.assertEqual(events, ["vision_extract", "ocr_layout", "span_map"])
-            self.assertEqual(result["status"], "RELEASED")
+            self.assertEqual(result["status"], "RELEASED", result.get("release_blockers"))
             self.assertTrue(Path(result["output_pdf"]).is_file())
 
     def test_qr_classification_redacts_entire_image_tag_bbox(self):
         class FakeAnalyzer:
+            dpi = 150
+
             def render_page(self, page, page_number, output_dir):
                 import numpy as np
                 from PIL import Image
@@ -209,6 +351,8 @@ class OrchestrationTests(unittest.TestCase):
             mapping_model = "opus"
             classifier_model = "haiku"
             material_model = "opus"
+            reviewer_model = "haiku"
+            review_threshold = 0.95
 
             def extract_page(self, image_path, page_number):
                 return {"redacted_information": []}
@@ -218,6 +362,11 @@ class OrchestrationTests(unittest.TestCase):
 
             def classify_crop(self, crop_path):
                 return {"category": "QR_BARCODE", "confidence": 0.99, "reason": "QR code"}
+
+            def review_flagged_page(self, _original, _redacted, page_number, flags):
+                return {"overall_decision": "REVIEW", "confidence": 0.5,
+                        "checks": [{"id": flag["id"], "decision": "REVIEW", "confidence": 0.5,
+                                    "remark": "Keep for human review"} for flag in flags], "remarks": []}
 
             @staticmethod
             def _norm(value):
@@ -233,8 +382,7 @@ class OrchestrationTests(unittest.TestCase):
             doc.close()
 
             def fake_redact(_source, output, regions, **_kwargs):
-                Path(output).parent.mkdir(parents=True, exist_ok=True)
-                Path(output).write_bytes(b"fixture")
+                _copy_pdf_fixture(_source, Path(output))
                 self.assertEqual(len(regions), 1)
                 self.assertEqual([regions[0][key] for key in ("x0", "y0", "x1", "y1")],
                                  [50.0, 25.0, 150.0, 125.0])
@@ -245,8 +393,243 @@ class OrchestrationTests(unittest.TestCase):
                 result = runner.run_document(source, root / "batch", page_limit=1)
             self.assertEqual(result["status"], "REVIEW_REQUIRED")
 
+    def test_code_candidate_is_classified_and_qr_bbox_redacted(self):
+        class FakeAnalyzer:
+            dpi = 150
+
+            def render_page(self, page, page_number, output_dir):
+                import numpy as np
+                from PIL import Image
+                output_dir.mkdir(parents=True, exist_ok=True)
+                path = output_dir / "page_0001.png"
+                image = np.full((40, 60, 3), 255, dtype=np.uint8)
+                Image.fromarray(image).save(path)
+                return path, image
+
+            def analyze(self, page, page_number, output_dir, rendered=None):
+                from PIL import Image
+                crop = output_dir / "qr_candidate.png"
+                Image.new("RGB", (20, 20), "white").save(crop)
+                return PageRecord(
+                    0, "page_0001", str(rendered[0]), 60, 40,
+                    float(page.rect.width), float(page.rect.height),
+                    code_regions=[Region("qr_code", [10, 10, 30, 30], 0.8,
+                                         crop_path=str(crop))],
+                ), rendered[1]
+
+        class FakeStages:
+            extraction_model = "opus"
+            mapping_model = "opus"
+            classifier_model = "haiku"
+            material_model = "opus"
+            reviewer_model = "haiku"
+            review_threshold = 0.95
+            classified_crops = []
+
+            def extract_page(self, image_path, page_number):
+                return {"redacted_information": [{
+                    "category": "access_code", "field_label": "QR code",
+                    "original_value": "CHECK REPORT QR code",
+                }]}
+
+            def map_redactions(self, spans, info, page_number):
+                return {"mappings": [], "unmatched": [{
+                    "value": "CHECK REPORT QR code", "category": "access_code",
+                    "reason": "Graphic code has no OCR text span",
+                }]}
+
+            def classify_crop(self, crop_path):
+                self.classified_crops.append(str(crop_path))
+                return {"category": "QR_BARCODE", "confidence": 0.99,
+                        "reason": "Visually identified as a QR code"}
+
+            def review_flagged_page(self, _original, _redacted, page_number, flags):
+                return {"overall_decision": "REVIEW", "confidence": 0.5,
+                        "checks": [{"id": flag["id"], "decision": "REVIEW", "confidence": 0.5,
+                                    "remark": "Keep for human review"} for flag in flags], "remarks": []}
+
+            @staticmethod
+            def _norm(value):
+                return "".join(char.casefold() for char in value if char.isalnum())
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "original.pdf"
+            doc = fitz.open()
+            doc.new_page(width=300, height=200)
+            doc.save(source)
+            doc.close()
+
+            def fake_redact(_source, output, regions, **_kwargs):
+                _copy_pdf_fixture(_source, Path(output))
+                self.assertEqual(len(regions), 1)
+                self.assertEqual([regions[0][key] for key in ("x0", "y0", "x1", "y1")],
+                                 [50.0, 50.0, 150.0, 150.0])
+                return {"status": "PASS", "findings": {}}
+
+            runner = IntegratedRedactionRunner(FakeAnalyzer(), FakeStages())
+            with patch("redaction_flow.runner.redact_pdf", side_effect=fake_redact):
+                result = runner.run_document(source, root / "batch")
+
+            self.assertEqual(result["status"], "RELEASED", result.get("release_blockers"))
+            self.assertEqual(len(FakeStages.classified_crops), 1)
+
+    def test_detected_code_candidate_can_be_classified_as_noise(self):
+        class FakeAnalyzer:
+            dpi = 150
+
+            def render_page(self, page, page_number, output_dir):
+                import numpy as np
+                from PIL import Image
+                output_dir.mkdir(parents=True, exist_ok=True)
+                path = output_dir / "page_0001.png"
+                image = np.full((40, 60, 3), 255, dtype=np.uint8)
+                Image.fromarray(image).save(path)
+                return path, image
+
+            def analyze(self, page, page_number, output_dir, rendered=None):
+                from PIL import Image
+                crop = output_dir / "candidate.png"
+                Image.new("RGB", (20, 20), "white").save(crop)
+                return PageRecord(
+                    0, "page_0001", str(rendered[0]), 60, 40,
+                    float(page.rect.width), float(page.rect.height),
+                    code_regions=[Region("qr_code", [10, 10, 30, 30], 0.8,
+                                         crop_path=str(crop))],
+                ), rendered[1]
+
+        class FakeStages:
+            extraction_model = "opus"
+            mapping_model = "opus"
+            classifier_model = "haiku"
+            material_model = "opus"
+            reviewer_model = "haiku"
+            review_threshold = 0.95
+
+            def extract_page(self, image_path, page_number):
+                return {"redacted_information": []}
+
+            def map_redactions(self, spans, info, page_number):
+                return {"mappings": [], "unmatched": []}
+
+            def classify_crop(self, crop_path):
+                return {"category": "NOISE", "confidence": 0.99,
+                        "reason": "False-positive code candidate"}
+
+            @staticmethod
+            def _norm(value):
+                return "".join(char.casefold() for char in value if char.isalnum())
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "original.pdf"
+            doc = fitz.open()
+            doc.new_page(width=300, height=200)
+            doc.save(source)
+            doc.close()
+
+            def fake_redact(_source, output, regions, **_kwargs):
+                _copy_pdf_fixture(_source, Path(output))
+                self.assertEqual(regions, [])
+                return {"status": "PASS", "findings": {}}
+
+            runner = IntegratedRedactionRunner(FakeAnalyzer(), FakeStages())
+            with patch("redaction_flow.runner.redact_pdf", side_effect=fake_redact):
+                result = runner.run_document(source, root / "batch")
+
+            self.assertEqual(result["status"], "RELEASED", result.get("release_blockers"))
+
+    def test_code_candidate_classified_as_material_uses_opus_material_policy(self):
+        class FakeAnalyzer:
+            dpi = 150
+
+            def render_page(self, page, page_number, output_dir):
+                import numpy as np
+                from PIL import Image
+                output_dir.mkdir(parents=True, exist_ok=True)
+                path = output_dir / "page_0001.png"
+                image = np.full((40, 60, 3), 255, dtype=np.uint8)
+                Image.fromarray(image).save(path)
+                return path, image
+
+            def analyze(self, page, page_number, output_dir, rendered=None):
+                from PIL import Image
+                crop = output_dir / "candidate.png"
+                Image.new("RGB", (20, 20), "white").save(crop)
+                return PageRecord(
+                    0, "page_0001", str(rendered[0]), 60, 40,
+                    float(page.rect.width), float(page.rect.height),
+                    code_regions=[Region("qr_code", [10, 10, 30, 30], 0.8,
+                                         crop_path=str(crop))],
+                ), rendered[1]
+
+        class FakeStages:
+            extraction_model = "opus"
+            mapping_model = "opus"
+            classifier_model = "haiku"
+            material_model = "opus"
+            reviewer_model = "haiku"
+            review_threshold = 0.95
+            inspected_crops = []
+
+            def extract_page(self, image_path, page_number):
+                return {"redacted_information": []}
+
+            def map_redactions(self, spans, info, page_number):
+                return {"mappings": [], "unmatched": []}
+
+            def classify_crop(self, crop_path):
+                return {"category": "MATERIAL_SAMPLE", "confidence": 0.99,
+                        "reason": "Material sample label"}
+
+            def inspect_material_crop(self, crop_path, crop_bbox, page_record, page_rect):
+                self.inspected_crops.append((str(crop_path), crop_bbox))
+                return {"pdf_regions": [{"page_number": 0, "x0": 55.0, "y0": 55.0,
+                                         "x1": 95.0, "y1": 95.0}],
+                        "review_items": [], "text_regions": [], "sensitive_values": []}
+
+            @staticmethod
+            def _norm(value):
+                return "".join(char.casefold() for char in value if char.isalnum())
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "original.pdf"
+            doc = fitz.open()
+            doc.new_page(width=300, height=200)
+            doc.save(source)
+            doc.close()
+
+            def fake_redact(_source, output, regions, **_kwargs):
+                _copy_pdf_fixture(_source, Path(output))
+                self.assertEqual(regions, [{"page_number": 0, "x0": 55.0, "y0": 55.0,
+                                            "x1": 95.0, "y1": 95.0}])
+                return {"status": "PASS", "findings": {}}
+
+            stages = FakeStages()
+            runner = IntegratedRedactionRunner(FakeAnalyzer(), stages)
+            with patch("redaction_flow.runner.redact_pdf", side_effect=fake_redact):
+                result = runner.run_document(source, root / "batch")
+
+            self.assertEqual(result["status"], "RELEASED", result.get("release_blockers"))
+            self.assertEqual(len(stages.inspected_crops), 1)
+
 
 class PdfRedactionTests(unittest.TestCase):
+    def test_page_scoped_sensitive_values_do_not_flag_other_pages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "two-pages.pdf"
+            doc = fitz.open()
+            for _ in range(2):
+                page = doc.new_page(width=300, height=120)
+                page.insert_text((30, 50), "REPORTID")
+            doc.save(path)
+            doc.close()
+
+            audit = audit_pdf(path, sensitive_values_by_page={0: ["REPORTID"]})
+
+            self.assertEqual(audit["findings"]["leaked_values"], [{"page_number": 0, "value_index": 0}])
+
     def test_text_mode_zero_removes_searchable_redacted_text(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

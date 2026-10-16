@@ -72,7 +72,9 @@ class PaddlePageAnalyzer:
         height, width = image.shape[:2]
         spans = self._ocr_spans(image_path)
         image_regions = self._layout_images(image_path, width, height)
-        code_regions = self._codes(image)
+        code_regions = self._filter_text_overlapped_code_candidates(
+            self._codes(image), spans, image_regions,
+        )
         all_regions = [*image_regions, *code_regions]
         for index, region in enumerate(all_regions, 1):
             x0, y0, x1, y1 = [int(round(value)) for value in region.bbox]
@@ -91,6 +93,48 @@ class PaddlePageAnalyzer:
             spans=spans, image_regions=image_regions, code_regions=code_regions,
         )
         return record, image
+
+    @staticmethod
+    def _filter_text_overlapped_code_candidates(
+        codes: list[Region], spans: list[TextSpan], image_regions: list[Region],
+    ) -> list[Region]:
+        """Drop code detections that are clearly ordinary OCR-dense text.
+
+        OpenCV can return QR corners for table/text patterns. Candidates contained
+        in a layout-detected image are retained; other candidates overlapping at
+        least three OCR spans are rejected.
+        """
+        kept = []
+        for code in codes:
+            x0, y0, x1, y1 = code.bbox
+            code_area = max(1.0, (x1 - x0) * (y1 - y0))
+            overlaps_image = any(
+                max(0.0, min(x1, image.bbox[2]) - max(x0, image.bbox[0]))
+                * max(0.0, min(y1, image.bbox[3]) - max(y0, image.bbox[1]))
+                / code_area >= 0.5
+                for image in image_regions
+            )
+            if overlaps_image:
+                kept.append(code)
+                continue
+
+            overlapping_spans = 0
+            for span in spans:
+                if not span.polygon:
+                    continue
+                sx0 = min(point[0] for point in span.polygon)
+                sy0 = min(point[1] for point in span.polygon)
+                sx1 = max(point[0] for point in span.polygon)
+                sy1 = max(point[1] for point in span.polygon)
+                span_area = max(1.0, (sx1 - sx0) * (sy1 - sy0))
+                intersection = max(0.0, min(x1, sx1) - max(x0, sx0)) * max(
+                    0.0, min(y1, sy1) - max(y0, sy0),
+                )
+                if intersection / span_area >= 0.15:
+                    overlapping_spans += 1
+            if overlapping_spans < 3:
+                kept.append(code)
+        return kept
 
     def _ocr_spans(self, image_path: Path) -> list[TextSpan]:
         if not self._ocr_worker.stdin or not self._ocr_worker.stdout or self._ocr_worker.poll() is not None:
@@ -154,32 +198,29 @@ class PaddlePageAnalyzer:
         image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
         regions = []
         try:
-            decoded, points, _ = cv2.QRCodeDetector().detectAndDecode(image_bgr)
-            if points is not None:
+            found, points = cv2.QRCodeDetector().detect(image_bgr)
+            if found and points is not None:
                 points = np.asarray(points).reshape(-1, 2)
                 bbox = [max(0.0, float(points[:, 0].min())), max(0.0, float(points[:, 1].min())),
                         min(float(width), float(points[:, 0].max())), min(float(height), float(points[:, 1].max()))]
                 if bbox[2] > bbox[0] and bbox[3] > bbox[1]:
-                    regions.append(Region("qr_code", bbox, 1.0 if decoded else 0.8, bool(decoded), source="OpenCV"))
+                    regions.append(Region("qr_code", bbox, 1.0, source="OpenCV"))
         except cv2.error as exc:
             raise RuntimeError(f"QR detection failed: {exc}") from exc
         try:
-            result = cv2.barcode_BarcodeDetector().detectAndDecode(image_bgr)
-            if len(result) == 3:
-                value, barcode_type, points = result
-                entries = [(value, barcode_type, points)] if points is not None else []
+            found, points = cv2.barcode_BarcodeDetector().detect(image_bgr)
+            if found and points is not None:
+                boxes = np.asarray(points)
+                if boxes.ndim == 2:
+                    boxes = boxes[np.newaxis, ...]
             else:
-                _, values, types, corners = result
-                values = values if values is not None else []
-                types = types if types is not None else []
-                corners = corners if corners is not None else []
-                entries = list(zip(values, types, corners))
-            for value, barcode_type, points in entries:
+                boxes = []
+            for points in boxes:
                 points = np.asarray(points).reshape(-1, 2)
                 bbox = [max(0.0, float(points[:, 0].min())), max(0.0, float(points[:, 1].min())),
                         min(float(width), float(points[:, 0].max())), min(float(height), float(points[:, 1].max()))]
                 if bbox[2] > bbox[0] and bbox[3] > bbox[1]:
-                    regions.append(Region("barcode", bbox, 1.0 if value else 0.8, bool(value), source=f"OpenCV:{barcode_type}"))
+                    regions.append(Region("barcode", bbox, 1.0, source="OpenCV"))
         except (cv2.error, ValueError, TypeError, AttributeError) as exc:
             raise RuntimeError(f"Barcode detection failed: {exc}") from exc
         return regions
@@ -187,7 +228,7 @@ class PaddlePageAnalyzer:
 def regions_to_json(record: PageRecord) -> dict[str, Any]:
     def serialize(regions: list[Region]) -> list[dict[str, Any]]:
         return [{"type": r.kind, "bbox_page_image_px": r.bbox, "score": r.score,
-                 "decoded": r.decoded, "crop_path": r.crop_path, "source": r.source} for r in regions]
+                 "crop_path": r.crop_path, "source": r.source} for r in regions]
     return {
         "page_number": record.page_number, "page_label": record.page_label,
         "image_path": record.image_path, "image_size_px": [record.image_width, record.image_height],

@@ -33,6 +33,10 @@ def main() -> None:
     parser.add_argument("--mapping-model", default="claude-opus-5-5")
     parser.add_argument("--classifier-model", default="claude-haiku-4-5@20251001")
     parser.add_argument("--material-model", default="claude-opus-5-5")
+    parser.add_argument("--review-model", default="claude-haiku-4-5@20251001",
+                        help="Fast model called only on pages already flagged for visual review")
+    parser.add_argument("--review-threshold", type=float, default=0.95,
+                        help="Self-reported confidence required to clear a review flag")
     parser.add_argument("--device", default="cpu", help="PP-DocLayoutV3 device, normally cpu")
     parser.add_argument("--ocr-python", type=Path,
                         default=Path(os.getenv("OCR_LEGACY_PYTHON", sys.executable)),
@@ -48,8 +52,9 @@ def main() -> None:
     if not args.input_root.exists():
         parser.error(f"Input root does not exist: {args.input_root}")
     if (args.dpi <= 0 or not 0.0 <= args.layout_threshold <= 1.0
-            or not 0.0 <= args.classification_threshold <= 1.0):
-        parser.error("dpi must be positive and both thresholds must be in [0, 1]")
+            or not 0.0 <= args.classification_threshold <= 1.0
+            or not 0.0 <= args.review_threshold <= 1.0):
+        parser.error("dpi must be positive and thresholds must be in [0, 1]")
     if args.limit is not None and args.limit < 1:
         parser.error("limit must be at least 1")
     if args.page_limit is not None and args.page_limit < 1:
@@ -78,6 +83,11 @@ def main() -> None:
 
     batch_root = args.output_root / f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
     gateway = VisionGateway()
+    review_url = os.getenv("REDACTION_REVIEW_GATEWAY_URL")
+    review_token = os.getenv("REDACTION_REVIEW_GATEWAY_TOKEN")
+    if bool(review_url) != bool(review_token):
+        parser.error("Set both REDACTION_REVIEW_GATEWAY_URL and REDACTION_REVIEW_GATEWAY_TOKEN, or neither")
+    review_gateway = VisionGateway(review_url, review_token, timeout=120, retries=1) if review_url and review_token else gateway
     analyzer = PaddlePageAnalyzer(
         dpi=args.dpi, layout_threshold=args.layout_threshold, device=args.device,
         ocr_python=args.ocr_python, layout_packages=args.layout_packages,
@@ -86,6 +96,9 @@ def main() -> None:
         gateway, args.extraction_model, args.mapping_model,
         args.classifier_model, args.material_model,
         classification_threshold=args.classification_threshold,
+        reviewer_gateway=review_gateway,
+        reviewer_model=args.review_model,
+        review_threshold=args.review_threshold,
     )
     runner = IntegratedRedactionRunner(analyzer, stages, text_redaction_mode=0)
     manifest = runner.run(pdfs, batch_root, page_limit=args.page_limit)

@@ -39,6 +39,7 @@ class IntegratedRedactionRunner:
             "mapping": document_dir / "span_mappings",
             "classification": document_dir / "image_classification",
             "material": document_dir / "material_decisions",
+            "targeted_review": document_dir / "targeted_review",
             "quarantine": document_dir / "quarantine",
             "release": document_dir / "release",
         }
@@ -46,11 +47,13 @@ class IntegratedRedactionRunner:
             path.mkdir(parents=True, exist_ok=True)
         page_records = []
         redaction_regions: list[dict[str, float | int]] = []
-        sensitive_values: list[str] = []
+        sensitive_values_by_page: dict[int, list[str]] = {}
         review_items: list[dict[str, Any]] = []
         unmatched_values: list[dict[str, Any]] = []
+        confirmed_qr_pages: set[int] = set()
         errors: list[dict[str, Any]] = []
-        extraction_seconds = ocr_seconds = mapping_seconds = classification_seconds = material_seconds = 0.0
+        extraction_seconds = 0.0
+        ocr_seconds = mapping_seconds = classification_seconds = material_seconds = 0.0
 
         try:
             original = fitz.open(str(source_pdf))
@@ -114,8 +117,8 @@ class IntegratedRedactionRunner:
                         "image_regions": [{"bbox": r.bbox, "score": r.score, "crop_path": r.crop_path,
                                            "source": r.source} for r in record.image_regions],
                         "code_regions": [{"kind": r.kind, "bbox": r.bbox, "score": r.score,
-                                          "decoded": r.decoded, "crop_path": r.crop_path,
-                                          "source": r.source} for r in record.code_regions],
+                                          "crop_path": r.crop_path, "source": r.source}
+                                         for r in record.code_regions],
                     }
                     self._write_json(paths["recognition"] / f"page_{page_number + 1:04d}.json", {
                         **spans_to_json(record), "spans": page_dict["spans"]})
@@ -138,6 +141,7 @@ class IntegratedRedactionRunner:
                 page_rect = original[page_number].rect
                 spans = page_dict["spans"]
                 mapping_path = paths["mapping"] / f"page_{page_number + 1:04d}.json"
+                page_unmatched = []
                 try:
                     cached_mapping = self._cached_json(mapping_path, self.stages.mapping_model)
                     if cached_mapping is None:
@@ -148,41 +152,32 @@ class IntegratedRedactionRunner:
                     else:
                         mapping = cached_mapping
                     page_dict["mapping"] = mapping
-                    unmatched_values.extend({"page_number": page_number, **item}
-                                            for item in mapping.get("unmatched", []) if isinstance(item, dict))
+                    page_unmatched = [item for item in mapping.get("unmatched", []) if isinstance(item, dict)]
                     for item in mapping.get("mappings", []):
                         rect = page_pixels_to_pdf_rect(item["bbox_page_image_px"], page_dict["image_width"],
                                                        page_dict["image_height"], page_rect,
                                                        page_dict["derotation_matrix"], page_dict["pdf_cropbox_pt"])
                         redaction_regions.append(pdf_rect_to_region(page_number, rect))
                         if item.get("value"):
-                            sensitive_values.append(str(item["value"]))
+                            sensitive_values_by_page.setdefault(page_number, []).append(str(item["value"]))
                 except Exception as exc:
                     errors.append({"page_number": page_number, "stage": "span_mapping", "error": str(exc)})
                     page_dict["mapping"] = {"mappings": [], "unmatched": []}
 
                 image_classifications = []
+                code_classifications = []
                 material_index = 0
                 for region_index, region in enumerate(page_dict["image_regions"], 1):
                     crop_path = Path(region["crop_path"])
                     try:
                         classification_path = paths["classification"] / f"page_{page_number + 1:04d}_image_{region_index:03d}.json"
                         classification = self._cached_json(classification_path, self.stages.classifier_model)
-                        code_overlaps = self._overlapping_codes(region["bbox"], page_dict["code_regions"])
-                        if classification is None and code_overlaps:
-                            classification = {
-                                "category": "QR_BARCODE", "confidence": 1.0,
-                                "reason": "Overlaps a QR/barcode region detected on the page",
-                                "model": self.stages.classifier_model,
-                                "source": "page_detector_overlap",
-                                "overlapping_code_regions": code_overlaps,
-                            }
-                        elif classification is None:
+                        if classification is None:
                             t0 = time.perf_counter()
                             classification = self.stages.classify_crop(crop_path)
                             classification_seconds += time.perf_counter() - t0
                             classification["model"] = self.stages.classifier_model
-                        if not code_overlaps and not classification.get("source"):
+                        if not classification.get("source"):
                             classification["source"] = "vision_api"
                         classification_record = {
                             "page_number": page_number, "page_label": page_dict["page_label"],
@@ -216,23 +211,103 @@ class IntegratedRedactionRunner:
                         }
                         self._write_json(material_path, decision_record)
                         redaction_regions.extend(decision["pdf_regions"])
-                        sensitive_values.extend(decision["sensitive_values"])
                         review_items.extend(decision["review_items"])
                     except Exception as exc:
                         errors.append({"page_number": page_number, "stage": "image_classification_or_material", "crop": str(crop_path), "error": str(exc)})
                         review_items.append({"page_number": page_number, "crop": str(crop_path),
                                              "reason": "Image-tag classification/material review stage failed"})
+
+                # Route every detected code crop through the same visual classifier. Decoding is
+                # not required: a QR/barcode classification redacts its detected bbox directly.
+                for code_index, code in enumerate(page_dict["code_regions"], 1):
+                    crop_path = Path(code["crop_path"])
+                    try:
+                        classification_path = paths["classification"] / (
+                            f"page_{page_number + 1:04d}_code_{code_index:03d}.json"
+                        )
+                        classification = self._cached_json(classification_path, self.stages.classifier_model)
+                        covering_qr = next((item for item in image_classifications
+                                            if item.get("category") == "QR_BARCODE"
+                                            and self._bbox_overlap_ratio(
+                                                code["bbox"], item["bbox_page_image_px"],
+                                            ) >= 0.5), None)
+                        if classification is None and covering_qr is not None:
+                            classification = {
+                                "category": "QR_BARCODE",
+                                "confidence": covering_qr.get("confidence", 1.0),
+                                "reason": "Candidate is covered by an image crop classified as QR/barcode",
+                                "source": "overlapping_image_classification",
+                            }
+                        elif classification is None:
+                            t0 = time.perf_counter()
+                            classification = self.stages.classify_crop(crop_path)
+                            classification_seconds += time.perf_counter() - t0
+                            classification["source"] = "vision_api"
+                        classification["model"] = self.stages.classifier_model
+                        classification_record = {
+                            "page_number": page_number, "page_label": page_dict["page_label"],
+                            "crop_path": str(crop_path), "bbox_page_image_px": code["bbox"],
+                            "candidate_kind": code["kind"], "detector": code["source"],
+                            **classification,
+                        }
+                        code_classifications.append(classification_record)
+                        self._write_json(classification_path, classification_record)
+                        category = classification["category"]
+                        if category == "QR_BARCODE":
+                            if covering_qr is None:
+                                rect = page_pixels_to_pdf_rect(
+                                    code["bbox"], page_dict["image_width"], page_dict["image_height"],
+                                    page_rect, page_dict["derotation_matrix"], page_dict["pdf_cropbox_pt"],
+                                )
+                                redaction_regions.append(pdf_rect_to_region(page_number, rect))
+                            continue
+                        if category != "MATERIAL_SAMPLE":
+                            continue
+                        material_path = paths["material"] / (
+                            f"page_{page_number + 1:04d}_code_{code_index:03d}_material.json"
+                        )
+                        decision = self._cached_json(material_path, self.stages.material_model)
+                        if decision is None:
+                            t0 = time.perf_counter()
+                            decision = self.stages.inspect_material_crop(
+                                crop_path, code["bbox"], page_dict, page_rect,
+                            )
+                            material_seconds += time.perf_counter() - t0
+                        decision_record = {
+                            "page_number": page_number, "crop_path": str(crop_path),
+                            "bbox_page_image_px": code["bbox"], "model": self.stages.material_model,
+                            "policy": POLICY_VERSION, **decision,
+                        }
+                        self._write_json(material_path, decision_record)
+                        redaction_regions.extend(decision["pdf_regions"])
+                        review_items.extend(decision["review_items"])
+                    except Exception as exc:
+                        errors.append({"page_number": page_number,
+                                       "stage": "code_classification_or_material",
+                                       "crop": str(crop_path), "error": str(exc)})
+                        review_items.append({
+                            "page_number": page_number, "crop": str(crop_path),
+                            "bbox_page_image_px": code["bbox"],
+                            "reason": "Detected code crop classification/material review stage failed",
+                        })
                 page_dict["image_classifications"] = image_classifications
+                page_dict["code_classifications"] = code_classifications
                 print(f"MAP_AND_CLASSIFY document={document_key} page={page_number + 1}/{count} "
                       f"mappings={len(page_dict.get('mapping', {}).get('mappings', []))} "
-                      f"image_crops={len(image_classifications)}", flush=True)
+                          f"image_crops={len(image_classifications)} "
+                          f"code_crops={len(code_classifications)}", flush=True)
 
-                # Code boxes outside/inside image-tag boxes are independently redacted as well.
-                for code in page_dict["code_regions"]:
-                    rect = page_pixels_to_pdf_rect(code["bbox"], page_dict["image_width"],
-                                                   page_dict["image_height"], page_rect,
-                                                   page_dict["derotation_matrix"], page_dict["pdf_cropbox_pt"])
-                    redaction_regions.append(pdf_rect_to_region(page_number, rect))
+                qr_protected = any(
+                    classification.get("category") == "QR_BARCODE"
+                    for classification in [*image_classifications, *code_classifications]
+                )
+                if qr_protected:
+                    confirmed_qr_pages.add(page_number)
+                unmatched_values.extend(
+                    {"page_number": page_number, **item}
+                    for item in page_unmatched
+                    if not (qr_protected and self._is_machine_code_description(item))
+                )
 
         # Missing extraction records are release blockers; retain exact unmatched extraction values.
         for page_number, redaction in enumerate(redaction_records):
@@ -244,6 +319,8 @@ class IntegratedRedactionRunner:
                            for item in page_mapping.get("mappings", []) if item.get("value")}
             for item in redaction.get("redacted_information", []) or []:
                 value = str(item.get("original_value", "")).strip()
+                if page_number in confirmed_qr_pages and self._is_machine_code_description(item):
+                    continue
                 if value and self.stages._norm(value) not in mapped_norm and not any(
                     int(entry.get("page_number", -1)) == page_number and
                     self.stages._norm(str(entry.get("value", ""))) == self.stages._norm(value)
@@ -263,7 +340,6 @@ class IntegratedRedactionRunner:
             "pages": [{"page_number": i, **record} for i, record in enumerate(redaction_records)],
         })
 
-        blockers = release_blockers(review_items, unmatched_values, errors)
         quarantine_path = paths["quarantine"] / f"{source_pdf.stem}_redacted.pdf"
         release_path = paths["release"] / f"{source_pdf.stem}_redacted.pdf"
         audit = None
@@ -271,12 +347,40 @@ class IntegratedRedactionRunner:
             try:
                 audit = redact_pdf(
                     source_pdf, quarantine_path, redaction_regions,
-                    apply_bbox_filter=False, sensitive_values=sensitive_values,
+                    apply_bbox_filter=False, sensitive_values_by_page=sensitive_values_by_page,
                     text_redaction_mode=self.text_redaction_mode,
                 )
             except Exception as exc:
                 errors.append({"stage": "pdf_redaction_audit", "error": str(exc)})
-                blockers = release_blockers(review_items, unmatched_values, errors)
+        blockers = release_blockers(review_items, unmatched_values, errors)
+        targeted_review_reports: list[dict[str, Any]] = []
+        targeted_review_seconds = 0.0
+        resolved_review_indices: set[int] = set()
+        targeted_review_errors: list[dict[str, Any]] = []
+        if audit is not None and audit.get("status") == "PASS" and review_items and quarantine_path.exists():
+            (targeted_review_reports, targeted_review_seconds, resolved_review_indices,
+             targeted_review_errors) = self._review_flagged_pages(
+                quarantine_path, page_images, review_items, paths["targeted_review"],
+            )
+            checks_by_id = {
+                check["id"]: check
+                for report in targeted_review_reports
+                for check in report.get("checks", [])
+            }
+            remaining_review_items = []
+            for index, item in enumerate(review_items):
+                if index in resolved_review_indices:
+                    continue
+                remaining = dict(item)
+                check = checks_by_id.get(f"B{index}")
+                if check is not None:
+                    note = f"Fast review: {check['decision']} ({check['confidence']:.2f})"
+                    if check.get("remark"):
+                        note += f" — {check['remark']}"
+                    remaining["reason"] = f"{item.get('reason', 'Visual review required')} [{note}]"
+                remaining_review_items.append(remaining)
+            blockers = release_blockers(remaining_review_items, unmatched_values,
+                                        [*errors, *targeted_review_errors])
         if audit is None:
             status = "REVIEW_REQUIRED" if blockers else "ERROR"
         elif can_release(audit, blockers):
@@ -301,10 +405,19 @@ class IntegratedRedactionRunner:
                                                    for path in paths["mapping"].glob("page_*.json")),
                               "review_regions": len(review_items), "unmatched_values": len(unmatched_values)},
             "release_blockers": blockers, "errors": errors, "audit": audit,
+            "targeted_review": {
+                "model": self.stages.reviewer_model,
+                "confidence_threshold": self.stages.review_threshold,
+                "pages_checked": len(targeted_review_reports),
+                "items_approved": len(resolved_review_indices),
+                "reports": targeted_review_reports,
+            },
             "timings_sec": {"vision_extraction": round(extraction_seconds, 2),
-                            "ocr_layout": round(ocr_seconds, 2), "span_mapping": round(mapping_seconds, 2),
+                            "ocr_layout": round(ocr_seconds, 2),
+                            "span_mapping": round(mapping_seconds, 2),
                             "image_classification": round(classification_seconds, 2),
                             "material_decisions": round(material_seconds, 2),
+                            "targeted_review": round(targeted_review_seconds, 2),
                             "document_total": round(time.perf_counter() - started, 2)},
         }
         self._write_json(document_dir / "pipeline_result.json", result)
@@ -315,6 +428,62 @@ class IntegratedRedactionRunner:
             flush=True,
         )
         return result
+
+    def _review_flagged_pages(
+        self,
+        redacted_pdf: Path,
+        page_images: list[tuple[Path, Any] | None],
+        review_items: list[dict[str, Any]],
+        report_dir: Path,
+    ) -> tuple[list[dict[str, Any]], float, set[int], list[dict[str, Any]]]:
+        """Spend one fast-model call only on each page with existing visual review flags."""
+        reports: list[dict[str, Any]] = []
+        resolved_indices: set[int] = set()
+        errors: list[dict[str, Any]] = []
+        elapsed = 0.0
+        threshold = self.stages.review_threshold
+        report_dir.mkdir(parents=True, exist_ok=True)
+        page_indices = sorted({int(item.get("page_number", -1)) for item in review_items
+                               if 0 <= int(item.get("page_number", -1)) < len(page_images)})
+        with fitz.open(str(redacted_pdf)) as redacted:
+            for page_number in page_indices:
+                original_render = page_images[page_number]
+                if original_render is None:
+                    errors.append({"stage": "targeted_review", "page_number": page_number,
+                                   "error": "Original page rendering unavailable for flagged-page review"})
+                    continue
+                page_flags = [
+                    {"id": f"B{index}", "reason": item.get("reason", "Visual review required")}
+                    for index, item in enumerate(review_items)
+                    if int(item.get("page_number", -1)) == page_number
+                ]
+                page_flag_indices = {f"B{index}": index for index, item in enumerate(review_items)
+                                     if int(item.get("page_number", -1)) == page_number}
+                pixmap = redacted[page_number].get_pixmap(
+                    matrix=fitz.Matrix(self.analyzer.dpi / 72, self.analyzer.dpi / 72), alpha=False,
+                )
+                started = time.perf_counter()
+                try:
+                    report = self.stages.review_flagged_page(
+                        original_render[0].read_bytes(), pixmap.tobytes("png"), page_number, page_flags,
+                    )
+                    elapsed += time.perf_counter() - started
+                    report["flag_count"] = len(page_flags)
+                    self._write_json(report_dir / f"page_{page_number + 1:04d}.json", report)
+                    reports.append(report)
+                    approved = (
+                        report["overall_decision"] == "APPROVE"
+                        and report["confidence"] >= threshold
+                        and all(check["decision"] == "APPROVE" and check["confidence"] >= threshold
+                                for check in report["checks"])
+                    )
+                    if approved:
+                        resolved_indices.update(page_flag_indices[check["id"]] for check in report["checks"])
+                except Exception as exc:
+                    elapsed += time.perf_counter() - started
+                    errors.append({"stage": "targeted_review", "page_number": page_number,
+                                   "error": str(exc)})
+        return reports, elapsed, resolved_indices, errors
 
     def run(self, pdfs: list[Path], batch_root: Path, page_limit: int | None = None) -> dict[str, Any]:
         results = []
@@ -340,6 +509,20 @@ class IntegratedRedactionRunner:
         }
         self._write_json(batch_root / "manifest.json", manifest)
         return manifest
+
+    @staticmethod
+    def _bbox_overlap_ratio(first: list[float], second: list[float]) -> float:
+        x0, y0, x1, y1 = first
+        a, b, c, d = second
+        area = max(1.0, (x1 - x0) * (y1 - y0))
+        intersection = max(0.0, min(x1, c) - max(x0, a)) * max(0.0, min(y1, d) - max(y0, b))
+        return intersection / area
+
+    @staticmethod
+    def _is_machine_code_description(item: dict[str, Any]) -> bool:
+        text = " ".join(str(item.get(key, "")) for key in ("value", "original_value", "category", "reason"))
+        normalized = "".join(character for character in text.casefold() if character.isalnum())
+        return "qrcode" in normalized or "barcode" in normalized or "barcodetext" in normalized
 
     @staticmethod
     def _overlapping_codes(image_bbox: list[float], codes: list[dict[str, Any]]) -> list[dict[str, Any]]:

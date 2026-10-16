@@ -2,29 +2,125 @@
 from __future__ import annotations
 
 import json
+import io
+import math
 from pathlib import Path
 from typing import Any
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageOps
 
 from .coordinates import clamp_pixel_bbox, crop_bbox_to_pdf_rect, pdf_rect_to_region
 from .gateway import VisionGateway
-from .prompts import CROP_CLASSIFICATION_SYSTEM, MATERIAL_TEXT_SYSTEM, MAPPING_SYSTEM, ORIGINAL_EXTRACTION_SYSTEM
+from .prompts import (
+    CROP_CLASSIFICATION_SYSTEM,
+    MATERIAL_TEXT_SYSTEM,
+    MAPPING_SYSTEM,
+    ORIGINAL_EXTRACTION_SYSTEM,
+    TARGETED_REVIEW_SYSTEM,
+)
 
 
 class RedactionStages:
     def __init__(self, gateway: VisionGateway, extraction_model: str, mapping_model: str,
                  classifier_model: str, material_model: str, classification_threshold: float = 0.75,
-                 material_padding_px: int = 3):
+                 material_padding_px: int = 3, reviewer_gateway: VisionGateway | None = None,
+                 reviewer_model: str = "claude-haiku-4-5@20251001", review_threshold: float = 0.95):
         self.gateway = gateway
         self.extraction_model = extraction_model
         self.mapping_model = mapping_model
         self.classifier_model = classifier_model
         self.material_model = material_model
+        self.reviewer_gateway = reviewer_gateway or gateway
+        self.reviewer_model = reviewer_model
+        self.review_threshold = review_threshold
+        if not 0.0 <= review_threshold <= 1.0:
+            raise ValueError("review_threshold must be in [0, 1]")
         self.classification_threshold = classification_threshold
         if material_padding_px < 0:
             raise ValueError("material_padding_px must be nonnegative")
         self.material_padding_px = material_padding_px
+
+    def review_flagged_page(
+        self,
+        original_png: bytes,
+        redacted_png: bytes,
+        page_number: int,
+        review_items: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Ask the fast reviewer only about already-flagged items on this page."""
+        with Image.open(io.BytesIO(original_png)) as original, Image.open(io.BytesIO(redacted_png)) as redacted:
+            left = ImageOps.exif_transpose(original).convert("RGB")
+            right = ImageOps.exif_transpose(redacted).convert("RGB")
+            max_width = 1000
+            scale = min(1.0, max_width / max(left.width, right.width))
+            if scale < 1.0:
+                left = left.resize((round(left.width * scale), round(left.height * scale)), Image.Resampling.LANCZOS)
+                right = right.resize((round(right.width * scale), round(right.height * scale)), Image.Resampling.LANCZOS)
+            canvas = Image.new("RGB", (left.width + right.width, max(left.height, right.height) + 32), "white")
+            canvas.paste(left, (0, 32))
+            canvas.paste(right, (left.width, 32))
+            draw = ImageDraw.Draw(canvas)
+            draw.text((8, 8), "ORIGINAL", fill="black")
+            draw.text((left.width + 8, 8), "REDACTED RESULT", fill="black")
+            buffer = io.BytesIO()
+            canvas.save(buffer, format="PNG", optimize=True)
+
+        flagged = [{"id": str(item["id"]), "reason": str(item.get("reason", "Visual review required"))[:300]}
+                   for item in review_items]
+        prompt = (
+            f"Review only the supplied existing flags on page {page_number + 1}; do not scan for other findings.\n"
+            f"FLAGS: {json.dumps(flagged, ensure_ascii=False)}\n"
+            "For each flag, say APPROVE only if the paired images clearly show benign content or the flagged sensitive "
+            "content is covered in the result. If it may be sensitive and remains visible, or you cannot tell, say REVIEW."
+        )
+        result, usage = self.reviewer_gateway.complete(
+            self.reviewer_model, TARGETED_REVIEW_SYSTEM, prompt, image=buffer.getvalue(), max_tokens=1024,
+        )
+        overall = str(result.get("overall_decision", "")).upper()
+        if overall not in {"APPROVE", "REVIEW"}:
+            raise ValueError(f"Invalid targeted-review decision: {overall!r}")
+        overall_confidence = self._validate_confidence(result.get("confidence"))
+        checks = result.get("checks")
+        if not isinstance(checks, list):
+            raise ValueError("Targeted-review checks must be a list")
+        expected_ids = {item["id"] for item in flagged}
+        normalized_checks = []
+        seen = set()
+        for check in checks:
+            if not isinstance(check, dict):
+                raise ValueError("Targeted-review check must be an object")
+            check_id = str(check.get("id", ""))
+            decision = str(check.get("decision", "")).upper()
+            if check_id not in expected_ids or check_id in seen or decision not in {"APPROVE", "REVIEW"}:
+                raise ValueError("Targeted reviewer returned unknown/duplicate IDs or an invalid decision")
+            seen.add(check_id)
+            normalized_checks.append({
+                "id": check_id,
+                "decision": decision,
+                "confidence": self._validate_confidence(check.get("confidence")),
+                "remark": str(check.get("remark", ""))[:400],
+            })
+        if seen != expected_ids:
+            raise ValueError("Targeted reviewer omitted a supplied review flag")
+        return {
+            "page_number": page_number,
+            "model": self.reviewer_model,
+            "overall_decision": overall,
+            "confidence": overall_confidence,
+            "checks": normalized_checks,
+            "remarks": [str(item)[:400] for item in (result.get("remarks") or [])[:5]],
+            "usage": usage,
+        }
+
+    @staticmethod
+    def _validate_confidence(value: Any) -> float:
+        try:
+            confidence = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Reviewer confidence must be a number") from exc
+        if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+            raise ValueError("Reviewer confidence must be between 0 and 1")
+        return confidence
 
     def extract_page(self, image_path: Path, page_number: int) -> dict[str, Any]:
         with Image.open(image_path) as image:
